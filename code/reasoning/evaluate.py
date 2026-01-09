@@ -8,6 +8,16 @@ Core logic:
 """
 
 from typing import List, Literal
+import os
+import json
+
+# Optional LLM integration (OpenAI). If no API key, fall back to heuristic.
+_openai_available = False
+try:
+    import openai
+    _openai_available = True
+except Exception:
+    _openai_available = False
 
 
 def evaluate_claim(claim: str, evidence_chunks: List[str]) -> Literal["support", "contradict", "unclear"]:
@@ -35,28 +45,93 @@ def evaluate_claim(claim: str, evidence_chunks: List[str]) -> Literal["support",
     combined_evidence = " ".join(evidence_chunks).lower()
     claim_lower = claim.lower()
     
-    # ========== PLACEHOLDER LLM CALL ==========
-    # In production, replace with actual LLM (e.g., OpenAI API):
-    #
-    # response = openai.ChatCompletion.create(
-    #     model="gpt-4",
-    #     messages=[
-    #         {
-    #             "role": "system",
-    #             "content": _build_system_prompt()
-    #         },
-    #         {
-    #             "role": "user",
-    #             "content": _build_user_prompt(claim, evidence_chunks)
-    #         }
-    #     ],
-    #     temperature=0.0
-    # )
-    # verdict = response["choices"][0]["message"]["content"].strip().lower()
-    
-    # For now, use heuristic fallback:
-    verdict = _heuristic_evaluate(claim_lower, combined_evidence, evidence_chunks)
-    
+    # Attempt to use an LLM judge. The LLM must return exactly one of three labels:
+    #   - "contradiction"
+    #   - "no_contradiction"
+    #   - "insufficient_evidence"
+    # We then map those to the pipeline's internal labels:
+    #   no_contradiction -> support
+    #   contradiction -> contradict
+    #   insufficient_evidence -> unclear
+    llm_label = None
+
+    # Build minimal user prompt (claim + evidence only)
+    evidence_text = "\n---\n".join(evidence_chunks) if evidence_chunks else "[NO EVIDENCE]"
+    user_prompt = (
+        f"Claim: {claim}\n\n"
+        f"Evidence excerpts:\n{evidence_text}\n\n"
+        "Please output EXACTLY ONE of these three words (only the word, no explanation):\n"
+        "contradiction\nno_contradiction\ninsufficient_evidence"
+    )
+
+    # Use OpenAI if available and API key present
+    try:
+        if _openai_available and os.environ.get("OPENAI_API_KEY"):
+            openai.api_key = os.environ.get("OPENAI_API_KEY")
+            # Use chat completion; deterministic with temperature=0
+            resp = openai.ChatCompletion.create(
+                model=os.environ.get("OPENAI_MODEL", "gpt-4"),
+                messages=[
+                    {"role": "system", "content": "You are a concise binary judge. Reply with one exact label only."},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.0,
+                max_tokens=16,
+            )
+            raw = resp["choices"][0]["message"]["content"].strip()
+            llm_label = raw.splitlines()[0].strip().lower()
+    except Exception:
+        llm_label = None
+
+    # If LLM not available or returned unexpected output, fallback to heuristic
+    if llm_label not in {"contradiction", "no_contradiction", "insufficient_evidence"}:
+        mapped = _heuristic_evaluate(claim_lower, combined_evidence, evidence_chunks)
+        return mapped
+
+    # Map LLM labels to internal verdicts used by the rest of the pipeline
+    mapping = {
+        "contradiction": "contradict",
+        "no_contradiction": "support",
+        "insufficient_evidence": "unclear",
+    }
+    verdict = mapping[llm_label]
+
+    # Optional: request a 2-3 sentence rationale and save to rationales.json
+    # Only do this if OpenAI key present (avoid extra API calls otherwise)
+    try:
+        if _openai_available and os.environ.get("OPENAI_API_KEY"):
+            rationale_prompt = (
+                f"Claim: {claim}\n\nEvidence:\n{evidence_text}\n\n"
+                f"Label: {llm_label}\n\n"
+                "Provide a 2-3 sentence rationale explaining why this label was chosen."
+            )
+            resp2 = openai.ChatCompletion.create(
+                model=os.environ.get("OPENAI_MODEL", "gpt-4"),
+                messages=[
+                    {"role": "system", "content": "You are a concise explainer. Provide exactly 2-3 short sentences."},
+                    {"role": "user", "content": rationale_prompt},
+                ],
+                temperature=0.0,
+                max_tokens=150,
+            )
+            rationale = resp2["choices"][0]["message"]["content"].strip()
+            # Save rationale entry
+            try:
+                out_path = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)), "rationales.json")
+                entry = {"claim": claim, "label": llm_label, "rationale": rationale}
+                if os.path.exists(out_path):
+                    with open(out_path, "r", encoding="utf-8") as rf:
+                        data = json.load(rf)
+                else:
+                    data = []
+                data.append(entry)
+                with open(out_path, "w", encoding="utf-8") as wf:
+                    json.dump(data, wf, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     return verdict
 
 
